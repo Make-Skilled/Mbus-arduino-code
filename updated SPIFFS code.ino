@@ -4,7 +4,7 @@
 #include <ArduinoHttpClient.h>
 #include <ArduinoJson.h>
 #include <SPIFFS.h>
-
+#include <time.h>
 // GPRS credentials
 const char apn[]      = "airtelgprs.com"; // APN
 const char gprsUser[] = "";               // GPRS User
@@ -36,6 +36,9 @@ HttpClient http(client, server, port);
 int buzzer = 19;
 int rled = 14;
 int gled = 12;
+
+unsigned long lastUploadTime = 0;
+const unsigned long uploadInterval = 21600000;  // Upload every 6 hours
 
 void setup() {
   SerialMon.begin(115200);  // Serial monitor
@@ -84,20 +87,23 @@ void setup() {
 }
 
 void loop() {
-  // Static input for testing
   String rfidData = "4A00A51922D4";
 
-  // Indicate RFID read success
   digitalWrite(buzzer, HIGH);
   delay(500);
   digitalWrite(buzzer, LOW);
   Serial.print("RFID Tag (Test): ");
   Serial.println(rfidData);
 
-  // Validate RFID tag
   validateRFIDTag(rfidData);
 
-  // Pause to avoid rapid repeats
+  // Periodically upload scanned tags
+  unsigned long currentTime = millis();
+  if (currentTime - lastUploadTime >= uploadInterval) {
+    uploadScannedTags();
+    lastUploadTime = currentTime;
+  }
+
   delay(5000);  // Wait 5 seconds before repeating
 }
 
@@ -183,6 +189,8 @@ void validateRFIDTag(const String &tag) {
       SerialMon.print("Balance Amount: ");
       SerialMon.println(balanceAmount);
 
+      saveScannedTag(tag, balanceAmount);
+
       // Check balance and blink appropriate LED
       if (balanceAmount > 5000) {
         // Blink red LED for "balance > 5000"
@@ -213,3 +221,94 @@ void validateRFIDTag(const String &tag) {
   delay(1000);
   digitalWrite(rled, LOW);   // Red LED OFF
 }
+void saveScannedTag(const String &tag, float balance) {
+  // Open the scanned tags file
+  File file = SPIFFS.open("/scanned_tags.json", FILE_READ);
+  DynamicJsonDocument doc(8192);
+
+  if (!file) {
+    SerialMon.println("Creating new scanned tags file...");
+  } else {
+    // Read existing data
+    size_t fileSize = file.size();
+    if (fileSize > 0) {
+      std::unique_ptr<char[]> jsonBuffer(new char[fileSize + 1]);
+      file.readBytes(jsonBuffer.get(), fileSize);
+      jsonBuffer[fileSize] = '\0';
+      deserializeJson(doc, jsonBuffer.get());
+    }
+    file.close();
+  }
+
+  // Ensure the root is an array
+  JsonArray tagsArray = doc.to<JsonArray>();
+
+  // Add the new scanned tag
+  JsonObject newTag = tagsArray.createNestedObject();
+  newTag["rfid_tag"] = tag;
+  newTag["balance"] = balance;
+
+  // Add timestamp if RTC is available
+  time_t now = time(nullptr);
+  if (now > 0) {  // Valid timestamp
+    newTag["timestamp"] = String(ctime(&now));
+  } else {
+    newTag["timestamp"] = "unknown";
+  }
+
+  // Save the updated array back to the file
+  file = SPIFFS.open("/scanned_tags.json", FILE_WRITE);
+  if (!file) {
+    SerialMon.println("Failed to open file for writing");
+    return;
+  }
+  serializeJson(doc, file);
+  file.close();
+  SerialMon.println("Scanned tag saved.");
+}
+
+void uploadScannedTags() {
+  // Open the scanned tags file
+  File file = SPIFFS.open("/scanned_tags.json", FILE_READ);
+  if (!file || file.size() == 0) {
+    SerialMon.println("No scanned tags to upload.");
+    return;
+  }
+
+  // Read the file contents
+  String jsonPayload;
+  while (file.available()) {
+    jsonPayload += char(file.read());
+  }
+  file.close();
+
+  // Connect to GPRS
+  if (!modem.gprsConnect(apn, gprsUser, gprsPass)) {
+    SerialMon.println("Failed to connect to GPRS for uploading");
+    return;
+  }
+
+  // Make HTTP POST request to upload scanned tags
+  SerialMon.println("Uploading scanned tags...");
+  http.beginRequest();
+  http.post("/uploadScannedTags.php", "application/json", jsonPayload);
+  http.endRequest();
+
+  // Read response
+  int statusCode = http.responseStatusCode();
+  String responseBody = http.responseBody();
+  SerialMon.print("Status code: ");
+  SerialMon.println(statusCode);
+  SerialMon.println("Response: ");
+  SerialMon.println(responseBody);
+
+  if (statusCode == 200) {
+    SerialMon.println("Scanned tags uploaded successfully. Clearing local data...");
+    SPIFFS.remove("/scanned_tags.json");  // Clear the local file after successful upload
+  } else {
+    SerialMon.println("Failed to upload scanned tags. Keeping local data.");
+  }
+
+  modem.gprsDisconnect();
+}
+
